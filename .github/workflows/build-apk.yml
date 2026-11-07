@@ -1,0 +1,560 @@
+
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App name"
+        required: true
+        type: string
+      app_url:
+        description: "HTTPS website URL"
+        required: true
+        type: string
+      icon_file_id:
+        description: "Telegram file_id of icon"
+        required: true
+        type: string
+      chat_id:
+        description: "Telegram chat id"
+        required: true
+        type: string
+      status_message_id:
+        description: "Telegram status message id (0 = none)"
+        required: false
+        default: "0"
+        type: string
+      build_id:
+        description: "Unique build id (12 hex chars)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.build_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      APP_NAME: ${{ inputs.app_name }}
+      APP_URL: ${{ inputs.app_url }}
+      ICON_FILE_ID: ${{ inputs.icon_file_id }}
+      CHAT_ID: ${{ inputs.chat_id }}
+      STATUS_MSG_ID: ${{ inputs.status_message_id }}
+      BUILD_ID: ${{ inputs.build_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [ -n "${TG_TOKEN:-}" ] || { echo "::error::Secret TELEGRAM_BOT_TOKEN is missing"; exit 1; }
+          [[ "$BUILD_ID" =~ ^[a-f0-9]{12}$ ]] || { echo "::error::invalid build_id"; exit 1; }
+          [[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || { echo "::error::invalid chat_id"; exit 1; }
+          [[ "$STATUS_MSG_ID" =~ ^[0-9]+$ ]] || { echo "::error::invalid status_message_id"; exit 1; }
+          [[ "$APP_URL" =~ ^https://[^[:space:]]+$ ]] || { echo "::error::invalid app_url"; exit 1; }
+          [[ "$ICON_FILE_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::invalid icon_file_id"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/proj"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Install Android SDK packages
+        run: |
+          SDKM="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Prepare launcher icons
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/proj"
+          command -v convert >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick; }
+
+          INFO=$(curl -fsS --max-time 30 -X POST \
+            --data-urlencode "file_id=${ICON_FILE_ID}" \
+            "https://api.telegram.org/bot${TG_TOKEN}/getFile")
+          FILE_PATH=$(echo "$INFO" | jq -r '.result.file_path // empty')
+          [ -n "$FILE_PATH" ] || { echo "::error::Icon file not found on Telegram"; exit 1; }
+
+          curl -fsS --max-time 60 -o icon_src "https://api.telegram.org/file/bot${TG_TOKEN}/${FILE_PATH}"
+          [ "$(stat -c%s icon_src)" -le 5242880 ] || { echo "::error::Icon too large"; exit 1; }
+          MIME=$(file -b --mime-type icon_src)
+          case "$MIME" in
+            image/png|image/jpeg) ;;
+            *) echo "::error::Unsupported icon type: $MIME"; exit 1 ;;
+          esac
+
+          RES=app/src/main/res
+          for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            d="${pair%%:*}"; s="${pair##*:}"
+            mkdir -p "$RES/mipmap-$d"
+            convert "icon_src[0]" -auto-orient -resize "${s}x${s}^" -gravity center -extent "${s}x${s}" "PNG32:$RES/mipmap-$d/ic_launcher.png"
+          done
+          rm -f icon_src
+
+      - name: Generate Android project
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/proj"
+          mkdir -p app/src/main/java/com/tgapp/webview app/src/main/res/values app/src/main/assets
+
+          python3 - <<'PY'
+          import os, re, sys
+          from xml.sax.saxutils import escape
+          name = os.environ["APP_NAME"].strip()
+          url = os.environ["APP_URL"].strip()
+          if len(name) < 2 or len(name) > 30 or not re.fullmatch(r"[\w][\w .\-\u200c]*", name):
+              sys.exit("invalid app name")
+          if not url.startswith("https://") or len(url) > 2000 or re.search(r"\s", url):
+              sys.exit("invalid url")
+          v = escape(name).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+          with open("app/src/main/res/values/strings.xml", "w", encoding="utf-8") as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">%s</string>\n</resources>\n' % v)
+          with open("app/src/main/assets/app_url.txt", "w", encoding="utf-8") as f:
+              f.write(url)
+          PY
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebApp"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.tgapp.webview'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.tgapp.b" + System.getenv("BUILD_ID")
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file(System.getenv("KS_FILE"))
+                      storePassword System.getenv("KS_PASS")
+                      keyAlias "app"
+                      keyPassword System.getenv("KS_PASS")
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      debuggable false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          EOF
+
+          cat > app/proguard-rules.pro <<'EOF'
+          -repackageclasses ''
+          -allowaccessmodification
+          -renamesourcefileattribute SourceFile
+          -keepattributes SourceFile
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name="com.tgapp.webview.MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/tgapp/webview/MainActivity.java <<'EOF'
+          package com.tgapp.webview;
+
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
+          import android.widget.ProgressBar;
+          import android.widget.Toast;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+
+              private static final int REQ_FILE = 1001;
+              private static final String[] EXTERNAL_SCHEMES = {
+                      "tel", "mailto", "sms", "geo", "tg", "whatsapp", "market"
+              };
+
+              private WebView webView;
+              private ProgressBar progressBar;
+              private String startUrl;
+              private boolean loadFailed = false;
+              private ValueCallback<Uri[]> filePathCallback;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  startUrl = readStartUrl();
+                  if (startUrl == null) {
+                      finish();
+                      return;
+                  }
+
+                  FrameLayout root = new FrameLayout(this);
+                  webView = new WebView(this);
+                  root.addView(webView, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progressBar.setMax(100);
+                  root.addView(progressBar, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
+                  setContentView(root);
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setBuiltInZoomControls(false);
+                  s.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  CookieManager cm = CookieManager.getInstance();
+                  cm.setAcceptCookie(true);
+                  cm.setAcceptThirdPartyCookies(webView, true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          return handleUrl(request.getUrl());
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                          loadFailed = false;
+                          progressBar.setVisibility(View.VISIBLE);
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          progressBar.setVisibility(View.GONE);
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                          if (request != null && request.isForMainFrame()) {
+                              loadFailed = true;
+                              Toast.makeText(MainActivity.this, "Connection failed", Toast.LENGTH_SHORT).show();
+                          }
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int newProgress) {
+                          progressBar.setProgress(newProgress);
+                          progressBar.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (filePathCallback != null) {
+                              filePathCallback.onReceiveValue(null);
+                          }
+                          filePathCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), REQ_FILE);
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState);
+                  } else {
+                      webView.loadUrl(startUrl);
+                  }
+              }
+
+              private boolean handleUrl(Uri uri) {
+                  if (uri == null || uri.getScheme() == null) {
+                      return true;
+                  }
+                  String scheme = uri.getScheme().toLowerCase(Locale.ROOT);
+                  if (scheme.equals("https")) {
+                      return false;
+                  }
+                  if (scheme.equals("http")) {
+                      return true;
+                  }
+                  for (String allowed : EXTERNAL_SCHEMES) {
+                      if (allowed.equals(scheme)) {
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                          } catch (Exception ignored) {
+                          }
+                          break;
+                      }
+                  }
+                  return true;
+              }
+
+              private String readStartUrl() {
+                  try (InputStream in = getAssets().open("app_url.txt");
+                       ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                      byte[] buf = new byte[1024];
+                      int n;
+                      while ((n = in.read(buf)) != -1) {
+                          out.write(buf, 0, n);
+                      }
+                      String u = out.toString("UTF-8").trim();
+                      return u.startsWith("https://") ? u : null;
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == REQ_FILE) {
+                      if (filePathCallback != null) {
+                          Uri[] result = null;
+                          if (resultCode == RESULT_OK && data != null) {
+                              result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+                          }
+                          filePathCallback.onReceiveValue(result);
+                          filePathCallback = null;
+                      }
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  if (webView != null) {
+                      webView.saveState(outState);
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (webView != null) {
+                      webView.onResume();
+                      if (loadFailed) {
+                          webView.loadUrl(startUrl);
+                      }
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  if (webView != null) {
+                      webView.onPause();
+                  }
+                  super.onPause();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (webView != null) {
+                      ViewGroup parent = (ViewGroup) webView.getParent();
+                      if (parent != null) {
+                          parent.removeView(webView);
+                      }
+                      webView.destroy();
+                      webView = null;
+                  }
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+      - name: Create signing key
+        run: |
+          set -euo pipefail
+          KS_PASS="$(openssl rand -hex 16)"
+          echo "::add-mask::$KS_PASS"
+          KS_FILE="$GITHUB_WORKSPACE/release.jks"
+          keytool -genkeypair -keystore "$KS_FILE" -alias app -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KS_PASS" -keypass "$KS_PASS" \
+            -dname "CN=App ${BUILD_ID}, O=TelegramAppBuilder, C=US" > /dev/null 2>&1
+          echo "KS_FILE=$KS_FILE" >> "$GITHUB_ENV"
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+
+      - name: Build release APK (R8 + ProGuard)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/proj"
+          gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK="$GITHUB_WORKSPACE/proj/app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner" verify "$APK"
+          echo "APK size: $(stat -c%s "$APK") bytes"
+
+      - name: Send APK to Telegram
+        run: |
+          set -euo pipefail
+          APK="$GITHUB_WORKSPACE/proj/app/build/outputs/apk/release/app-release.apk"
+          SLUG=$(python3 -c 'import os,re,unicodedata;n=unicodedata.normalize("NFKD",os.environ["APP_NAME"]).encode("ascii","ignore").decode();s=re.sub(r"[^A-Za-z0-9]+","-",n).strip("-")[:30];print(s or "app")')
+          OUT="$GITHUB_WORKSPACE/${SLUG}.apk"
+          cp "$APK" "$OUT"
+
+          CAPTION=$(printf '✅ %s\n📦 com.tgapp.b%s' "$APP_NAME" "$BUILD_ID")
+          ARGS=()
+          if [ "$STATUS_MSG_ID" != "0" ]; then
+            ARGS+=(--form-string "reply_parameters={\"message_id\":${STATUS_MSG_ID},\"allow_sending_without_reply\":true}")
+          fi
+
+          RESP=$(curl -sS --max-time 300 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+            -F "chat_id=${CHAT_ID}" \
+            --form-string "caption=${CAPTION}" \
+            -F "document=@${OUT};type=application/vnd.android.package-archive" \
+            "${ARGS[@]}")
+          if ! echo "$RESP" | jq -e '.ok == true' > /dev/null; then
+            echo "::error::sendDocument failed: $(echo "$RESP" | jq -r '.description // "unknown error"')"
+            exit 1
+          fi
+
+          if [ "$STATUS_MSG_ID" != "0" ]; then
+            curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MSG_ID}" \
+              --data-urlencode "text=✅ ساخت با موفقیت انجام شد؛ APK ارسال شد." > /dev/null || true
+          fi
+
+      - name: Notify failure
+        if: ${{ failure() || cancelled() }}
+        run: |
+          [ -n "${TG_TOKEN:-}" ] || exit 0
+          [[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || exit 0
+          TEXT=$'❌ ساخت اپلیکیشن ناموفق بود.\nجزئیات: '"$RUN_URL"
+          if [[ "$STATUS_MSG_ID" =~ ^[0-9]+$ ]] && [ "$STATUS_MSG_ID" != "0" ]; then
+            curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MSG_ID}" \
+              --data-urlencode "text=${TEXT}" > /dev/null || true
+          else
+            curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${TEXT}" > /dev/null || true
+          fi
